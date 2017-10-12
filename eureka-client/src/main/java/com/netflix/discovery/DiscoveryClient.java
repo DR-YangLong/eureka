@@ -144,6 +144,7 @@ public class DiscoveryClient implements EurekaClient {
 
     private final Provider<HealthCheckHandler> healthCheckHandlerProvider;
     private final Provider<HealthCheckCallback> healthCheckCallbackProvider;
+    private final PreRegistrationHandler preRegistrationHandler;
     private final AtomicReference<Applications> localRegionApps = new AtomicReference<Applications>();
     private final Lock fetchRegistryUpdateLock = new ReentrantLock();
     // monotonically increasing generation counter to ensure stale threads do not reset registry to an older version
@@ -301,9 +302,11 @@ public class DiscoveryClient implements EurekaClient {
             this.healthCheckHandlerProvider = args.healthCheckHandlerProvider;
             this.healthCheckCallbackProvider = args.healthCheckCallbackProvider;
             this.eventListeners.addAll(args.getEventListeners());
+            this.preRegistrationHandler = args.preRegistrationHandler;
         } else {
             this.healthCheckCallbackProvider = null;
             this.healthCheckHandlerProvider = null;
+            this.preRegistrationHandler = null;
         }
         
         this.applicationInfoManager = applicationInfoManager;
@@ -357,14 +360,15 @@ public class DiscoveryClient implements EurekaClient {
             DiscoveryManager.getInstance().setEurekaClientConfig(config);
 
             initTimestampMs = System.currentTimeMillis();
-
             logger.info("Discovery Client initialized at timestamp {} with initial instances count: {}",
                     initTimestampMs, this.getApplications().size());
+
             return;  // no need to setup up an network tasks and we are done
         }
 
         try {
-            scheduler = Executors.newScheduledThreadPool(3,
+            // default size of 2 - 1 each for heartbeat and cacheRefresh
+            scheduler = Executors.newScheduledThreadPool(2,
                     new ThreadFactoryBuilder()
                             .setNameFormat("DiscoveryClient-%d")
                             .setDaemon(true)
@@ -409,7 +413,25 @@ public class DiscoveryClient implements EurekaClient {
             fetchRegistryFromBackup();
         }
 
+        // call and execute the pre registration handler before all background tasks (inc registration) is started
+        if (this.preRegistrationHandler != null) {
+            this.preRegistrationHandler.beforeRegistration();
+        }
+
+        if (clientConfig.shouldRegisterWithEureka() && clientConfig.shouldEnforceRegistrationAtInit()) {
+            try {
+                if (!register() ) {
+                    throw new IllegalStateException("Registration error at startup. Invalid server response.");
+                }
+            } catch (Throwable th) {
+                logger.error("Registration error at startup.", th.getMessage());
+                throw new IllegalStateException(th);
+            }
+        }
+
+        // finally, init the schedule tasks (e.g. cluster resolvers, heartbeat, instanceInfo replicator, fetch
         initScheduledTasks();
+
         try {
             Monitors.registerObject(this);
         } catch (Throwable e) {
@@ -759,7 +781,7 @@ public class DiscoveryClient implements EurekaClient {
                     + virtualHostname);
         }
         Applications apps = this.localRegionApps.get();
-        int index = (int) (apps.getNextIndex(virtualHostname.toUpperCase(Locale.ROOT),
+        int index = (int) (apps.getNextIndex(virtualHostname,
                 secure).incrementAndGet() % instanceInfoList.size());
         return instanceInfoList.get(index);
     }
@@ -817,7 +839,12 @@ public class DiscoveryClient implements EurekaClient {
             if (httpResponse.getStatusCode() == 404) {
                 REREGISTER_COUNTER.increment();
                 logger.info("{} - Re-registering apps/{}", PREFIX + appPathIdentifier, instanceInfo.getAppName());
-                return register();
+                long timestamp = instanceInfo.setIsDirtyWithTime();
+                boolean success = register();
+                if (success) {
+                    instanceInfo.unsetIsDirty(timestamp);
+                }
+                return success;
             }
             return httpResponse.getStatusCode() == 200;
         } catch (Throwable e) {
@@ -858,7 +885,9 @@ public class DiscoveryClient implements EurekaClient {
             cancelScheduledTasks();
 
             // If APPINFO was registered
-            if (applicationInfoManager != null && clientConfig.shouldRegisterWithEureka()) {
+            if (applicationInfoManager != null
+                    && clientConfig.shouldRegisterWithEureka()
+                    && clientConfig.shouldUnregisterOnShutdown()) {
                 applicationInfoManager.setInstanceStatus(InstanceStatus.DOWN);
                 unregister();
             }
@@ -1124,24 +1153,6 @@ public class DiscoveryClient implements EurekaClient {
         if (serverApps == null) {
             logger.warn("Cannot fetch full registry from the server; reconciliation failure");
             return;
-        }
-
-        if (logger.isDebugEnabled()) {
-            try {
-                Map<String, List<String>> reconcileDiffMap = getApplications().getReconcileMapDiff(serverApps);
-                StringBuilder reconcileBuilder = new StringBuilder("");
-                for (Map.Entry<String, List<String>> mapEntry : reconcileDiffMap.entrySet()) {
-                    reconcileBuilder.append(mapEntry.getKey()).append(": ");
-                    for (String displayString : mapEntry.getValue()) {
-                        reconcileBuilder.append(displayString);
-                    }
-                    reconcileBuilder.append('\n');
-                }
-                String reconcileString = reconcileBuilder.toString();
-                logger.debug("The reconcile string is {}", reconcileString);
-            } catch (Throwable e) {
-                logger.error("Could not calculate reconcile string ", e);
-            }
         }
 
         if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {

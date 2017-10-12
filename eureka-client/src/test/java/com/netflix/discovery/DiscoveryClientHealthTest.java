@@ -16,6 +16,10 @@ public class DiscoveryClientHealthTest extends AbstractDiscoveryClientTester {
     protected void setupProperties() {
         super.setupProperties();
         ConfigurationManager.getConfigInstance().setProperty("eureka.registration.enabled", "true");
+        // as the tests in this class triggers the instanceInfoReplicator explicitly, set the below config
+        // so that it does not run as a background task
+        ConfigurationManager.getConfigInstance().setProperty("eureka.appinfo.initial.replicate.time", Integer.MAX_VALUE);
+        ConfigurationManager.getConfigInstance().setProperty("eureka.appinfo.replicate.interval", Integer.MAX_VALUE);
     }
 
     @Override
@@ -28,7 +32,6 @@ public class DiscoveryClientHealthTest extends AbstractDiscoveryClientTester {
     @Test
     public void testCallback() throws Exception {
         MyHealthCheckCallback myCallback = new MyHealthCheckCallback(true);
-        client.registerHealthCheckCallback(myCallback);
 
         Assert.assertTrue(client instanceof DiscoveryClient);
         DiscoveryClient clientImpl = (DiscoveryClient) client;
@@ -39,6 +42,8 @@ public class DiscoveryClientHealthTest extends AbstractDiscoveryClientTester {
         Assert.assertEquals("Instance info status not as expected.", InstanceInfo.InstanceStatus.STARTING,
                 clientImpl.getInstanceInfo().getStatus());
         Assert.assertFalse("Healthcheck callback invoked when status is STARTING.", myCallback.isInvoked());
+
+        client.registerHealthCheckCallback(myCallback);
 
         clientImpl.getInstanceInfo().setStatus(InstanceInfo.InstanceStatus.OUT_OF_SERVICE);
         Assert.assertEquals("Instance info status not as expected.", InstanceInfo.InstanceStatus.OUT_OF_SERVICE,
@@ -62,7 +67,6 @@ public class DiscoveryClientHealthTest extends AbstractDiscoveryClientTester {
     @Test
     public void testHandler() throws Exception {
         MyHealthCheckHandler myHealthCheckHandler = new MyHealthCheckHandler(InstanceInfo.InstanceStatus.UP);
-        client.registerHealthCheck(myHealthCheckHandler);
 
         Assert.assertTrue(client instanceof DiscoveryClient);
         DiscoveryClient clientImpl = (DiscoveryClient) client;
@@ -71,6 +75,9 @@ public class DiscoveryClientHealthTest extends AbstractDiscoveryClientTester {
 
         Assert.assertEquals("Instance info status not as expected.", InstanceInfo.InstanceStatus.STARTING,
                 clientImpl.getInstanceInfo().getStatus());
+
+        client.registerHealthCheck(myHealthCheckHandler);
+
         instanceInfoReplicator.run();
 
         Assert.assertTrue("Healthcheck callback not invoked when status is STARTING.", myHealthCheckHandler.isInvoked());
